@@ -62,6 +62,40 @@ async def create_user(
     user = await crud_user.create(db, obj_in=user_in)
     return user
 
+@router.put("/{user_id}", response_model=UserSchema)
+async def update_user(
+    *,
+    db: AsyncSession = Depends(deps.get_db),
+    user_id: int,
+    user_in: UserUpdate,
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """
+    Update a user.
+    """
+    user = await crud_user.get(db, id=user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+        
+    if current_user.role not in [UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER]:
+        raise HTTPException(status_code=400, detail="Not enough permissions")
+        
+    if current_user.role == UserRole.PRODUCT_MANAGER:
+        if user.role not in [UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.MED_REP]:
+            raise HTTPException(status_code=400, detail="Product Manager can only edit subordinates")
+            
+    # Check if new username is already taken by someone else
+    if user_in.username and user_in.username != user.username:
+        user_exists = await crud_user.get_by_username(db, username=user_in.username)
+        if user_exists:
+            raise HTTPException(
+                status_code=400,
+                detail="The user with this username already exists in the system.",
+            )
+            
+    user = await crud_user.update(db, db_obj=user, obj_in=user_in)
+    return user
+
 @router.get("/me", response_model=UserSchema)
 async def read_user_me(
     current_user: User = Depends(deps.get_current_user),
