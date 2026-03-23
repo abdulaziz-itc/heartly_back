@@ -39,6 +39,9 @@ async def get_comprehensive_reports(
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
     # 1. Fetch Plans (Plans are stored as month/year)
+    start_year = start_date.year
+    end_year = end_date.year
+    
     plans_query = select(
         Plan.doctor_id,
         Doctor.full_name.label("doctor_name"),
@@ -105,19 +108,19 @@ async def get_comprehensive_reports(
         BonusLedger.doctor_id,
         func.sum(
             case(
-                (BonusLedger.ledger_type == "accrual", BonusLedger.amount), 
+                [(BonusLedger.ledger_type == "accrual", BonusLedger.amount)], 
                 else_=0
             )
         ).label("earned_bonus"),
         func.sum(
             case(
-                (BonusLedger.ledger_type == "advance", -BonusLedger.amount), 
+                [(BonusLedger.ledger_type == "advance", -BonusLedger.amount)], 
                 else_=0
             )
         ).label("predinvest_given"),
         func.sum(
             case(
-                (BonusLedger.ledger_type == "offset", -BonusLedger.amount), 
+                [(BonusLedger.ledger_type == "offset", -BonusLedger.amount)], 
                 else_=0
             )
         ).label("predinvest_paid_off")
