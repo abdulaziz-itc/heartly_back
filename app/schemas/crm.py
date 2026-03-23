@@ -50,10 +50,14 @@ class MedicalOrganizationBase(BaseModel):
     region_id: int
     org_type: Optional[MedicalOrganizationType] = MedicalOrganizationType.CLINIC
     brand: Optional[str] = None
+    inn: Optional[str] = None
     director_name: Optional[str] = None
     contact_phone: Optional[str] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class MedicalOrganizationCreate(MedicalOrganizationBase):
+    inn: str
     assigned_rep_ids: Optional[List[int]] = []
 
 class MedicalOrganizationUpdate(BaseModel):
@@ -62,9 +66,12 @@ class MedicalOrganizationUpdate(BaseModel):
     region_id: Optional[int] = None
     org_type: Optional[MedicalOrganizationType] = None
     brand: Optional[str] = None
+    inn: Optional[str] = None
     director_name: Optional[str] = None
     contact_phone: Optional[str] = None
     assigned_rep_ids: Optional[List[int]] = None
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
 
 class MedicalOrganization(MedicalOrganizationBase):
     id: int
@@ -77,6 +84,7 @@ class MedicalOrganization(MedicalOrganizationBase):
 # Doctor
 class DoctorBase(BaseModel):
     full_name: str
+    is_active: Optional[bool] = True
     contact1: Optional[str] = None
     contact2: Optional[str] = None
     email: Optional[str] = None
@@ -97,6 +105,7 @@ class DoctorCreate(DoctorBase):
 
 class DoctorUpdate(BaseModel):
     full_name: Optional[str] = None
+    is_active: Optional[bool] = None
     contact1: Optional[str] = None
     contact2: Optional[str] = None
     email: Optional[str] = None

@@ -5,6 +5,7 @@ from app.models.sales import ReservationStatus, InvoiceStatus, PaymentType
 from app.schemas.user import User
 from app.schemas.product import Product
 from app.schemas.crm import Doctor, MedicalOrganization
+from app.schemas.warehouse import Warehouse
 
 # Plan
 class PlanBase(BaseModel):
@@ -31,6 +32,7 @@ class Plan(PlanBase):
     med_org: Optional[MedicalOrganization] = None
     doctor: Optional[Doctor] = None
     product: Optional[Product] = None
+    fact_quantity: Optional[int] = 0
     class Config:
         orm_mode = True
         from_attributes = True
@@ -39,8 +41,18 @@ class Plan(PlanBase):
 class ReservationItemBase(BaseModel):
     product_id: int
     quantity: int
+    returned_quantity: int = 0
     price: float
     discount_percent: float = 0.0
+    marketing_amount: Optional[float] = 0.0
+    return_requested_quantity: int = 0
+
+class ReservationReturnItem(BaseModel):
+    product_id: int
+    quantity: int
+
+class ReservationReturnCreate(BaseModel):
+    items: List[ReservationReturnItem]
 
 class ReservationItemCreate(ReservationItemBase):
     pass
@@ -49,8 +61,11 @@ class ReservationItem(ReservationItemBase):
     id: int
     total_price: float
     product: Optional[Product] = None
+    default_marketing_amount: Optional[float] = 0.0
+    
     class Config:
         orm_mode = True
+        from_attributes = True
 
 # Reservation
 class ReservationBase(BaseModel):
@@ -58,6 +73,13 @@ class ReservationBase(BaseModel):
     med_org_id: Optional[int] = None
     description: Optional[str] = None
     validity_date: Optional[datetime] = None
+    is_bonus_eligible: bool = True
+    nds_percent: float = 12.0
+    is_tovar_skidka: bool = False
+    source_invoice_id: Optional[int] = None
+    is_deletion_pending: bool = False
+    deletion_requested_by_id: Optional[int] = None
+    is_return_pending: bool = False
 
 class ReservationCreate(ReservationBase):
     warehouse_id: int
@@ -66,37 +88,121 @@ class ReservationCreate(ReservationBase):
 class ReservationUpdate(BaseModel):
     status: Optional[ReservationStatus] = None
 
+class ReservationDataUpdate(BaseModel):
+    factura_number: Optional[str] = None
+    realization_date: Optional[datetime] = None
+    discount_percent: Optional[float] = None
+
 class Reservation(ReservationBase):
     id: int
     date: datetime
     status: ReservationStatus
     total_amount: float
+    is_bonus_eligible: bool
+    nds_percent: Optional[float] = 12.0
+    is_tovar_skidka: bool = False
+    source_invoice_id: Optional[int] = None
     created_by_id: int
     created_by: Optional[User] = None
-    # med_org: Optional[MedicalOrganization] = None
+    med_org: Optional[MedicalOrganization] = None
+    warehouse: Optional[Warehouse] = None
+    invoice: Optional["Invoice"] = None
     items: List[ReservationItem] = []
     
     class Config:
         orm_mode = True
+        from_attributes = True
+
+# Reservation schema used inside Invoice to break circular reference
+class ReservationInInvoice(ReservationBase):
+    id: int
+    date: datetime
+    status: ReservationStatus
+    total_amount: float
+    is_bonus_eligible: bool
+    nds_percent: Optional[float] = 12.0
+    is_tovar_skidka: bool = False
+    source_invoice_id: Optional[int] = None
+    created_by_id: int
+    created_by: Optional[User] = None
+    med_org: Optional[MedicalOrganization] = None
+    warehouse: Optional[Warehouse] = None
+    items: List[ReservationItem] = []
+    # Note: no 'invoice' field here - avoids circular reference
+    
+    class Config:
+        orm_mode = True
+        from_attributes = True
 
 # Invoice
 class InvoiceBase(BaseModel):
     reservation_id: int
     total_amount: float
+    factura_number: Optional[str] = None
+    realization_date: Optional[datetime] = None
+    promo_balance: float = 0.0
+    is_deletion_pending: bool = False
+    deletion_requested_by_id: Optional[int] = None
 
 class Invoice(InvoiceBase):
     id: int
     date: datetime
     paid_amount: float
     status: InvoiceStatus
+    factura_number: Optional[str] = None
+    realization_date: Optional[datetime] = None
+    promo_balance: float = 0.0
+    payments: List["Payment"] = []
+    reservation: Optional[ReservationInInvoice] = None
     class Config:
         orm_mode = True
+        from_attributes = True
+
+
+class MedicalOrganizationLite(BaseModel):
+    id: int
+    name: str
+    address: Optional[str] = None
+    org_type: Optional[str] = None
+    
+    class Config:
+        from_attributes = True
+
+class ReservationLite(ReservationBase):
+    id: int
+    date: datetime
+    status: ReservationStatus
+    total_amount: float
+    is_bonus_eligible: bool
+    nds_percent: Optional[float] = 12.0
+    med_org: Optional[MedicalOrganizationLite] = None
+    warehouse_id: int
+    created_by_id: int
+    
+    class Config:
+        from_attributes = True
+
+class InvoiceLite(InvoiceBase):
+    id: int
+    date: datetime
+    paid_amount: float
+    status: InvoiceStatus
+    reservation: Optional[ReservationLite] = None
+
+    class Config:
+        from_attributes = True
+
+class DeletionRequests(BaseModel):
+    reservations: List[ReservationLite]
+    invoices: List[InvoiceLite]
+    return_requests: List[ReservationLite] = []
 
 # Payment
 class PaymentBase(BaseModel):
     invoice_id: int
     amount: float
     payment_type: PaymentType
+    comment: Optional[str] = None
 
 class PaymentCreate(PaymentBase):
     pass
@@ -105,8 +211,12 @@ class Payment(PaymentBase):
     id: int
     date: datetime
     processed_by_id: int
+    processed_by: Optional[User] = None
     class Config:
         orm_mode = True
+
+Reservation.model_rebuild()
+Invoice.model_rebuild()
 
 # Doctor Fact Assignment
 class DoctorFactAssignmentBase(BaseModel):
@@ -114,6 +224,7 @@ class DoctorFactAssignmentBase(BaseModel):
     doctor_id: int
     product_id: int
     quantity: int
+    amount: Optional[float] = None
     month: int
     year: int
 
@@ -123,8 +234,10 @@ class DoctorFactAssignmentCreate(DoctorFactAssignmentBase):
 class DoctorFactAssignment(DoctorFactAssignmentBase):
     id: int
     created_at: datetime
+    product: Optional[Product] = None
     class Config:
         orm_mode = True
+        from_attributes = True
 
 class SaleFact(BaseModel):
     id: int
@@ -169,6 +282,54 @@ class BonusPayment(BonusPaymentBase):
     id: int
     created_at: datetime
     product: Optional[ProductInBonus] = None
+    class Config:
+        orm_mode = True
+        from_attributes = True
+
+# Bonus Allocation
+class BonusAllocationCreate(BaseModel):
+    med_rep_id: Optional[int] = None  # If provided, allocate from this MedRep's balance (for admins/directors)
+    doctor_id: int
+    product_id: int  # Required - bonus tied to specific product
+    quantity: int    # Number of units doctor is being paid bonus for
+    amount_per_unit: Optional[float] = None # MedRep can override how much per unit
+    target_month: int
+    target_year: int
+    notes: Optional[str] = None
+
+# Unassigned Sale Sub-schemas
+class MedOrgInUnassigned(BaseModel):
+    id: int
+    name: str
+    class Config:
+        from_attributes = True
+
+class ReservationInUnassigned(BaseModel):
+    id: int
+    med_org: Optional[MedOrgInUnassigned] = None
+    class Config:
+        from_attributes = True
+
+class InvoiceInUnassigned(BaseModel):
+    id: int
+    reservation: Optional[ReservationInUnassigned] = None
+    total_amount: float
+    paid_amount: float
+    class Config:
+        from_attributes = True
+
+class UnassignedSaleBase(BaseModel):
+    invoice_id: int
+    med_rep_id: int
+    product_id: int
+    total_quantity: int
+    paid_quantity: int
+    assigned_quantity: int
+
+class UnassignedSale(UnassignedSaleBase):
+    id: int
+    product: Optional[Product] = None
+    invoice: Optional[InvoiceInUnassigned] = None
     class Config:
         orm_mode = True
         from_attributes = True

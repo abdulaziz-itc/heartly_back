@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, ForeignKey, Date, Float, DateTime, Table
+from sqlalchemy import Column, Integer, String, ForeignKey, Date, Float, DateTime, Table, Boolean
 from sqlalchemy.orm import relationship
 import enum
 from datetime import datetime
@@ -9,6 +9,7 @@ class MedicalOrganizationType(str, enum.Enum):
     PHARMACY = "pharmacy"
     LECHEBNIY = "lechebniy"
     HOSPITAL = "hospital"
+    WHOLESALE = "wholesale"
 
 # Association table for MedRep to Organization (Many-to-Many)
 medrep_organization = Table(
@@ -42,8 +43,12 @@ class MedicalOrganization(Base):
     region_id = Column(Integer, ForeignKey("region.id"))
     org_type = Column(String, default=MedicalOrganizationType.CLINIC)
     brand = Column(String, nullable=True)
+    inn = Column(String, nullable=True)
     director_name = Column(String, nullable=True)
     contact_phone = Column(String, nullable=True)
+    credit_balance = Column(Float, default=0.0)
+    latitude = Column(Float, nullable=True)
+    longitude = Column(Float, nullable=True)
     
     # Replaced assigned_rep_id with many-to-many relationship
     assigned_reps = relationship("User", secondary=medrep_organization, backref="assigned_organizations")
@@ -54,6 +59,7 @@ class MedicalOrganization(Base):
 class Doctor(Base):
     id = Column(Integer, primary_key=True, index=True)
     full_name = Column(String, index=True, nullable=False)
+    is_active = Column(Boolean, default=True)
     
     contact1 = Column(String, nullable=True)
     contact2 = Column(String, nullable=True)
@@ -74,6 +80,17 @@ class Doctor(Base):
     category = relationship("DoctorCategory", back_populates="doctors")
     med_org = relationship("MedicalOrganization", back_populates="doctors")
     assigned_rep = relationship("User", backref="assigned_doctors")
+
+
+class MedicalOrganizationStock(Base):
+    __tablename__ = "med_org_stock"
+    id = Column(Integer, primary_key=True, index=True)
+    med_org_id = Column(Integer, ForeignKey("medicalorganization.id"), nullable=False)
+    product_id = Column(Integer, ForeignKey("product.id"), nullable=False)
+    quantity = Column(Integer, default=0)
+
+    med_org = relationship("MedicalOrganization", backref="stocks")
+    product = relationship("Product")
 
 class Notification(Base):
     id = Column(Integer, primary_key=True, index=True)

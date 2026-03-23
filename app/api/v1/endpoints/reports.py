@@ -23,6 +23,18 @@ async def get_comprehensive_reports(
     period: str = Query("monthly", regex="^(daily|weekly|monthly|quarterly|yearly)$")
 ) -> Any:
     """
+    Get comprehensive reports for the dashboard.
+    Aggregates data from Sales (Fact), Plans, and Bonuses.
+    
+    Parameters:
+    - start_date, end_date: Date range for the report.
+    - period: Grouping period (daily, weekly, monthly, quarterly, yearly).
+    
+    Returns a dictionary containing:
+    - summary: Total facts, plans, and earned bonuses.
+    - details: List of per-doctor/product breakdown with plan vs fact comparison.
+    - charts: Time-series data for historical trends.
+    """
     Generate comprehensive reports for Director and Deputy Director.
     Aggregates plans, facts (sales), and bonuses based on the selected period.
     """
