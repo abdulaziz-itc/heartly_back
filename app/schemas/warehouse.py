@@ -24,8 +24,9 @@ class WarehouseCreate(WarehouseBase):
 class Warehouse(WarehouseBase):
     id: int
     stocks: Optional[List[Stock]] = []
+    is_wholesale: bool = False
+
     class Config:
-        orm_mode = True
         from_attributes = True
 
 class StockFulfillment(BaseModel):

@@ -1,4 +1,5 @@
 from typing import Any, List, Optional
+from datetime import datetime
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query, Request
 from fastapi.encoders import jsonable_encoder
@@ -10,7 +11,7 @@ from app.api import deps
 from app.core.config import settings
 from app.crud import crud_user
 from app.models.user import User, UserRole
-from app.schemas.user import User as UserSchema, UserCreate, UserUpdate
+from app.schemas.user import User as UserSchema, UserCreate, UserUpdate, UserLoginHistory
 
 router = APIRouter()
 
@@ -26,7 +27,7 @@ async def read_users(
     """
     Retrieve users. Only for specific roles (e.g., DEPUTY_DIRECTOR).
     """
-    if current_user.role not in [UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.HRD]:
         raise HTTPException(status_code=400, detail="Not enough permissions")
     
     users = await crud_user.get_multi(
@@ -50,15 +51,30 @@ async def create_user(
     """
     Create new user.
     """
-    if current_user.role not in [UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.HRD]:
         raise HTTPException(status_code=400, detail="Not enough permissions")
     
-    # If the creator is a Product Manager, enforce themselves as the manager if they are creating a subordinate
+    # If the creator is a Product Manager or Regional Manager, enforce themselves as the manager
+    # AND for Regional Manager, enforce regional boundaries
     if current_user.role == UserRole.PRODUCT_MANAGER:
         if user_in.role not in [UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.MED_REP]:
             raise HTTPException(status_code=400, detail="Product Manager can only create subordinates")
         user_in.manager_id = current_user.id
+    elif current_user.role == UserRole.REGIONAL_MANAGER:
+        if user_in.role != UserRole.MED_REP:
+            raise HTTPException(status_code=400, detail="Regional Manager can only create Medical Representatives")
+        user_in.manager_id = current_user.id
         
+        # Enforce regional boundaries
+        if user_in.region_ids:
+            from sqlalchemy.orm import selectinload
+            result = await db.execute(select(User).options(selectinload(User.assigned_regions)).where(User.id == current_user.id))
+            rm_db = result.scalars().first()
+            allowed_ids = [r.id for r in rm_db.assigned_regions] if rm_db else []
+            for rid in user_in.region_ids:
+                if rid not in allowed_ids:
+                    raise HTTPException(status_code=400, detail=f"Unauthorized region assignment: Region {rid} is not assigned to you.")
+
     user = await crud_user.get_by_username(db, username=user_in.username)
     if user:
         raise HTTPException(
@@ -90,12 +106,27 @@ async def update_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
         
-    if current_user.role not in [UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.HRD]:
         raise HTTPException(status_code=400, detail="Not enough permissions")
         
     if current_user.role == UserRole.PRODUCT_MANAGER:
         if user.role not in [UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.MED_REP]:
             raise HTTPException(status_code=400, detail="Product Manager can only edit subordinates")
+    elif current_user.role == UserRole.REGIONAL_MANAGER:
+        if user.manager_id != current_user.id:
+            raise HTTPException(status_code=400, detail="Regional Manager can only edit their own direct subordinates")
+        if user_in.role and user_in.role != UserRole.MED_REP:
+             raise HTTPException(status_code=400, detail="Regional Manager can only manage Medical Representatives")
+        
+        # Enforce regional boundaries
+        if user_in.region_ids:
+            from sqlalchemy.orm import selectinload
+            result = await db.execute(select(User).options(selectinload(User.assigned_regions)).where(User.id == current_user.id))
+            rm_db = result.scalars().first()
+            allowed_ids = [r.id for r in rm_db.assigned_regions] if rm_db else []
+            for rid in user_in.region_ids:
+                if rid not in allowed_ids:
+                    raise HTTPException(status_code=400, detail=f"Unauthorized region assignment: Region {rid} is not assigned to you.")
             
     # Validation for deactivation (is_active = False)
     if user_in.is_active is False and user.is_active is True:
@@ -173,15 +204,18 @@ async def get_med_reps(
     Get users (optionally filtered by role) with their manager name resolved.
     Used for the medical representatives page with role filter tabs.
     """
+    from sqlalchemy.orm import selectinload
     # Get all users to build manager lookup
-    all_users_result = await db.execute(select(User))
+    all_users_result = await db.execute(select(User).options(selectinload(User.assigned_regions)))
     all_users = all_users_result.scalars().all()
     
     # Build manager name lookup
     manager_lookup = {u.id: u.full_name for u in all_users}
     
     # Filter by role if specified, otherwise return med_reps by default
-    if role:
+    if role == "all":
+        filtered = all_users
+    elif role:
         filtered = [u for u in all_users if u.role == role]
     else:
         filtered = [u for u in all_users if u.role == UserRole.MED_REP]
@@ -196,9 +230,11 @@ async def get_med_reps(
         descendant_ids = await get_descendant_ids(db, current_user.id)
         filtered = [u for u in filtered if u.id in descendant_ids]
     
-    # Build response with manager name
+    # Build response with manager name and region IDs
     result = []
     for user in filtered:
+        # Load assigned_regions if not loaded
+        region_ids = [r.id for r in user.assigned_regions] if hasattr(user, 'assigned_regions') else []
         result.append({
             "id": user.id,
             "username": user.username,
@@ -206,6 +242,7 @@ async def get_med_reps(
             "role": user.role,
             "is_active": user.is_active,
             "manager_name": manager_lookup.get(user.manager_id, None) if user.manager_id else None,
+            "region_ids": region_ids
         })
     
     return result
@@ -226,7 +263,7 @@ async def reassign_user_dependencies(
     Transfer all subordinates, territories (doctors, organizations), and active plans 
     from one user to another user of the same role.
     """
-    if current_user.role not in [UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.ADMIN, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
         raise HTTPException(status_code=403, detail="Not enough permissions to reassign.")
         
     from_user = await crud_user.get(db, id=req.from_user_id)
@@ -241,6 +278,13 @@ async def reassign_user_dependencies(
     if from_user.role in [UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
         if current_user.role not in [UserRole.ADMIN, UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR]:
             raise HTTPException(status_code=403, detail="Only Admin, Director, or Deputy Director can reassign manager authority.")
+            
+    # For PM/RM, ensure both users are their descendants
+    if current_user.role in [UserRole.PRODUCT_MANAGER, UserRole.REGIONAL_MANAGER, UserRole.FIELD_FORCE_MANAGER]:
+        from app.crud.crud_user import get_descendant_ids
+        descendants = await get_descendant_ids(db, current_user.id)
+        if req.from_user_id not in descendants or req.to_user_id not in descendants:
+            raise HTTPException(status_code=403, detail="You can only reassign between your own subordinates.")
             
     # Reassign subordinates
     subordinates = await db.execute(select(User).where(User.manager_id == req.from_user_id))
@@ -336,3 +380,36 @@ async def reassign_user_dependencies(
     )
     await db.commit()
     return {"msg": "Successfully transferred all dependencies."}
+
+@router.get("/login-history", response_model=List[UserLoginHistory])
+async def read_login_history(
+    db: AsyncSession = Depends(deps.get_db),
+    skip: int = 0,
+    limit: int = 100,
+    month: Optional[int] = Query(None, ge=1, le=12),
+    year: Optional[int] = Query(None),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """
+    Retrieve user login history. Only for specific roles (e.g., HRD, DIRECTOR, INVESTOR).
+    """
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HRD]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    return await crud_user.get_login_history(
+        db, skip=skip, limit=limit, month=month, year=year
+    )
+
+@router.delete("/login-history")
+async def delete_login_history(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """
+    Clear all login history. Only for HRD, DIRECTOR, or INVESTOR.
+    """
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HRD]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    count = await crud_user.clear_login_history(db)
+    return {"msg": f"Successfully cleared {count} login history records."}

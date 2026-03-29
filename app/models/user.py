@@ -1,12 +1,15 @@
-from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Enum
+import datetime
+from sqlalchemy import Column, Integer, String, Boolean, ForeignKey, Enum, DateTime
 from sqlalchemy.orm import relationship
 import enum
 from app.db.base_class import Base
 
 class UserRole(str, enum.Enum):
+    INVESTOR = "investor"
     ADMIN = "admin"
     DIRECTOR = "director"
     DEPUTY_DIRECTOR = "deputy_director"
+    HRD = "hrd"
     HEAD_OF_ORDERS = "head_of_orders"
     HEAD_OF_WAREHOUSE = "head_of_warehouse"
     WHOLESALE_MANAGER = "wholesale_manager"
@@ -28,3 +31,16 @@ class User(Base):
     
     # Relationship to access subordinates
     subordinates = relationship("User", backref="manager", remote_side=[id])
+
+    # Explicit relationship definitions using strings to avoid circular imports
+    assigned_regions = relationship("Region", secondary="user_regions", back_populates="assigned_users")
+
+class UserLoginHistory(Base):
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("user.id"), nullable=False)
+    login_at = Column(DateTime, default=datetime.datetime.utcnow)
+    ip_address = Column(String, nullable=True)
+    location = Column(String, nullable=True)
+    user_agent = Column(String, nullable=True)
+
+    user = relationship("User", backref="login_history")

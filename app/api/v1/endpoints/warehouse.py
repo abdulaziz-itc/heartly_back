@@ -1,7 +1,7 @@
 from typing import Any, List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, and_
+from sqlalchemy import select, and_, update, delete, func
 from sqlalchemy.orm import selectinload
 import logging
 
@@ -20,8 +20,18 @@ async def get_warehouses(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    # Only Warehouse Head, Orders Head, Director, Admin
-    allowed = {UserRole.HEAD_OF_WAREHOUSE, UserRole.HEAD_OF_ORDERS, UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR, UserRole.ADMIN}
+    # Allowed roles for listing warehouses
+    allowed = {
+        UserRole.HEAD_OF_WAREHOUSE, 
+        UserRole.HEAD_OF_ORDERS, 
+        UserRole.DIRECTOR, 
+        UserRole.DEPUTY_DIRECTOR, 
+        UserRole.ADMIN,
+        UserRole.MED_REP,
+        UserRole.PRODUCT_MANAGER,
+        UserRole.FIELD_FORCE_MANAGER,
+        UserRole.REGIONAL_MANAGER
+    }
     if current_user.role not in allowed:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
@@ -35,7 +45,7 @@ async def create_warehouse(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    allowed = {UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed = {UserRole.INVESTOR, UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
@@ -66,7 +76,7 @@ async def add_stock(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """Add stock to a warehouse."""
-    allowed = {UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed = {UserRole.INVESTOR, UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
@@ -108,113 +118,154 @@ async def add_stock(
     )
     return {"ok": True, "new_quantity": stock.quantity}
 
-from app.schemas.sales import DeletionRequests
-
-@router.get("/deletion-requests", response_model=DeletionRequests)
+@router.get("/deletion-requests", response_model=Any)
 async def get_deletion_requests(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """List all reservations and invoices pending deletion."""
+    
     if current_user.role not in [UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     try:
+        from app.models.sales import Reservation, Invoice, ReservationItem
+        from app.schemas.sales import DeletionRequests, ApprovalReservationSchema, ApprovalInvoiceSchema
+        
         # Reservations pending deletion
-        res_query = select(Reservation).options(
-            selectinload(Reservation.med_org),
-            # warehouse_id is a direct column, no need for selectinload(Reservation.warehouse) if using Lite schema's warehouse_id
-        ).where(Reservation.is_deletion_pending == True)
+        res_query = (
+            select(Reservation)
+            .options(
+                selectinload(Reservation.med_org),
+                selectinload(Reservation.items).selectinload(ReservationItem.product)
+            )
+            .where(Reservation.is_deletion_pending == True)
+        )
         res_result = await db.execute(res_query)
         reservations = res_result.scalars().all()
         
         # Invoices pending deletion (Facturas)
-        inv_query = select(Invoice).join(
-            Reservation, Invoice.reservation_id == Reservation.id
-        ).options(
-            selectinload(Invoice.reservation).selectinload(Reservation.med_org),
-        ).where(Invoice.is_deletion_pending == True)
+        inv_query = (
+            select(Invoice)
+            .options(
+                selectinload(Invoice.reservation).options(
+                    selectinload(Reservation.med_org),
+                    selectinload(Reservation.items).selectinload(ReservationItem.product)
+                )
+            )
+            .where(Invoice.is_deletion_pending == True)
+        )
         inv_result = await db.execute(inv_query)
         invoices = inv_result.scalars().all()
         
+        # SUPER DEEP DEBUG ON LIVE DB
+        all_inv_ids_res = await db.execute(select(Invoice.id))
+        actual_ids_in_db = [r[0] for r in all_inv_ids_res.all()]
+        
+        # COUNT GHOSTS
+        pending_inv_count = await db.execute(select(func.count(Invoice.id)).where(Invoice.is_deletion_pending == True))
+        pending_res_count = await db.execute(select(func.count(Reservation.id)).where(Reservation.is_deletion_pending == True))
+        pending_ret_count = await db.execute(select(func.count(Reservation.id)).where(Reservation.is_return_pending == True))
+        
+        stats = {
+            "total_invoices": len(actual_ids_in_db),
+            "pending_invoices_in_db": pending_inv_count.scalar(),
+            "pending_reservations_in_db": pending_res_count.scalar(),
+            "pending_returns_in_db": pending_ret_count.scalar(),
+        }
+        logging.info(f"LIVE STATS: {stats}")
+        
         # Pending returns
-        ret_query = select(Reservation).options(
-            selectinload(Reservation.med_org),
-        ).where(Reservation.is_return_pending == True)
+        ret_query = (
+            select(Reservation)
+            .options(
+                selectinload(Reservation.med_org),
+                selectinload(Reservation.items).selectinload(ReservationItem.product)
+            )
+            .where(Reservation.is_return_pending == True)
+        )
         ret_result = await db.execute(ret_query)
         return_requests = ret_result.scalars().all()
+
+        # MANUAL MAPPING for maximum robustness
+        def map_reservation(r):
+            res_items = []
+            for item in r.items:
+                res_items.append({
+                    "product_name": item.product.name if item.product else "N/A",
+                    "quantity": item.quantity,
+                    "price": item.price,
+                    "total_price": item.total_price
+                })
+            return {
+                "id": r.id,
+                "customer_name": r.customer_name,
+                "med_org_name": r.med_org.name if r.med_org else None,
+                "date": r.date.isoformat() if r.date else None,
+                "total_amount": r.total_amount,
+                "items": res_items
+            }
+
+        def map_return(r):
+            res_items = []
+            return_total_net = 0.0
+            for item in r.items:
+                if (item.return_requested_quantity or 0) > 0:
+                    qty = item.return_requested_quantity
+                    item_net = (qty * item.price) * (1 - (item.discount_percent or 0) / 100)
+                    return_total_net += item_net
+                    res_items.append({
+                        "product_name": item.product.name if item.product else "N/A",
+                        "quantity": qty,
+                        "price": item.price,
+                        "total_price": item_net # Value being returned
+                    })
+            
+            # Return with NDS
+            return_total_with_nds = return_total_net * (1 + (r.nds_percent or 0) / 100)
+            
+            return {
+                "id": r.id,
+                "customer_name": r.customer_name,
+                "med_org_name": r.med_org.name if r.med_org else None,
+                "date": r.date.isoformat() if r.date else None,
+                "total_amount": return_total_with_nds, # Actual return amount
+                "full_reservation_amount": r.total_amount,
+                "items": res_items
+            }
+
+        mapped_reservations = [map_reservation(r) for r in reservations]
+        mapped_returns = [map_return(r) for r in return_requests]
         
+        # Invoices
+        debug_invoices = []
+        for i in invoices:
+            inv_data = {
+                "id": i.id,
+                "factura_number": f"DB_ID:{i.id} | ALL:{actual_ids_in_db} | {i.factura_number}",
+                "date": i.date.isoformat() if i.date else None,
+                "total_amount": i.total_amount,
+                "reservation": map_reservation(i.reservation) if i.reservation else None
+            }
+            debug_invoices.append(inv_data)
+
+        import time
         return {
-            "reservations": reservations,
-            "invoices": invoices,
-            "return_requests": return_requests
+            "reservations": mapped_reservations,
+            "invoices": debug_invoices,
+            "return_requests": mapped_returns,
+            "debug_timestamp": time.time(),
+            "debug_stats": stats
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@router.post("/deletion-requests/{entity_type}/{entity_id}/approve")
-async def approve_deletion(
-    entity_type: str,
-    entity_id: int,
-    request: Request,
-    db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    if current_user.role not in [UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN]:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
-    
-    if entity_type == "reservation":
-        # Call service to actually cancel/delete and restore stock
-        await ReservationService.cancel_reservation(db, entity_id)
-        await log_action(db, current_user, "DELETE_APPROVED", "Reservation", entity_id, f"Удаление брони #{entity_id} одобрено.", request)
-    elif entity_type == "invoice":
-        # Invoices are often deleted by cancelling the reservation if linked
-        # Find the reservation first
-        inv_query = select(Invoice).where(Invoice.id == entity_id)
-        inv_res = await db.execute(inv_query)
-        invoice = inv_res.scalar_one_or_none()
-        if not invoice:
-            raise HTTPException(status_code=404, detail="Invoice not found")
-        
-        res_id = invoice.reservation_id
-        await ReservationService.cancel_reservation(db, res_id)
-        await log_action(db, current_user, "DELETE_APPROVED", "Invoice", entity_id, f"Удаление фактуры #{entity_id} одобрено.", request)
-    else:
-        raise HTTPException(status_code=400, detail="Invalid entity type")
-    
-    return {"ok": True}
-
-@router.post("/deletion-requests/{entity_type}/{entity_id}/reject")
-async def reject_deletion(
-    entity_type: str,
-    entity_id: int,
-    request: Request,
-    db: AsyncSession = Depends(deps.get_db),
-    current_user: User = Depends(deps.get_current_user),
-) -> Any:
-    if current_user.role not in [UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN]:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
-    
-    if entity_type == "reservation":
-        res_query = select(Reservation).where(Reservation.id == entity_id)
-        res_res = await db.execute(res_query)
-        res = res_res.scalar_one_or_none()
-        if res:
-            res.is_deletion_pending = False
-            res.deletion_requested_by_id = None
-            await db.commit()
-            await log_action(db, current_user, "DELETE_REJECTED", "Reservation", entity_id, f"Удаление брони #{entity_id} отклонено.", request)
-    elif entity_type == "invoice":
-        inv_query = select(Invoice).where(Invoice.id == entity_id)
-        inv_res = await db.execute(inv_query)
-        inv = inv_res.scalar_one_or_none()
-        if inv:
-            inv.is_deletion_pending = False
-            inv.deletion_requested_by_id = None
-            await db.commit()
-            await log_action(db, current_user, "DELETE_REJECTED", "Invoice", entity_id, f"Удаление фактуры #{entity_id} отклонено.", request)
-    
-    return {"ok": True}
+        import traceback
+        logging.error(f"FETCH FAILED: {str(e)}", exc_info=True)
+        return {
+            "error": True,
+            "detail": f"FETCH FAILED: {str(e)}",
+            "trace": traceback.format_exc()[-500:],
+            "reservations": [], "invoices": [], "return_requests": []
+        }
 
 @router.post("/deletion-requests/return/{entity_id}/approve")
 async def approve_return(
@@ -245,3 +296,120 @@ async def reject_return(
     await crud_sales.reject_return_reservation_items(db, entity_id)
     await log_action(db, current_user, "RETURN_REJECTED", "Reservation", entity_id, f"Возврат по брони #{entity_id} отклонен складом.", request)
     return {"ok": True}
+
+@router.post("/deletion-requests/{entity_type}/{entity_id}/approve")
+async def approve_deletion(
+    entity_type: str,
+    entity_id: int,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    logging.info(f"ACTION: {entity_type} ID {entity_id} request for approval by user {current_user.id}")
+    if current_user.role not in [UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    if entity_type == "reservation":
+        # Call service to actually cancel/delete and restore stock
+        await ReservationService.cancel_reservation(db, entity_id)
+        await log_action(db, current_user, "DELETE_APPROVED", "Reservation", entity_id, f"Удаление брони #{entity_id} одобрено.", request)
+    elif entity_type == "invoice":
+        # Invoices are often deleted by cancelling the reservation if linked
+        # Find the reservation first
+        inv_query = select(Invoice).where(Invoice.id == entity_id)
+        inv_res = await db.execute(inv_query)
+        invoice = inv_res.scalar_one_or_none()
+        if not invoice:
+            # Deep debug: list all IDs
+            all_invoices = await db.execute(select(Invoice.id))
+            ids = [row[0] for row in all_invoices.all()]
+            raise HTTPException(status_code=404, detail=f"Invoice #{entity_id} not found (APPROVE). Available IDs: {ids}")
+        
+        res_id = invoice.reservation_id
+        await ReservationService.cancel_reservation(db, res_id)
+        await log_action(db, current_user, "DELETE_APPROVED", "Invoice", entity_id, f"Удаление фактуры #{entity_id} одобрено.", request)
+    else:
+        raise HTTPException(status_code=400, detail="Invalid entity type")
+    
+    return {"ok": True}
+
+@router.post("/deletion-requests/{entity_type}/{entity_id}/reject")
+async def reject_deletion(
+    entity_type: str,
+    entity_id: int,
+    request: Request,
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    logging.info(f"ACTION: {entity_type} ID {entity_id} request for REJECTION by user {current_user.id}")
+    if current_user.role not in [UserRole.HEAD_OF_WAREHOUSE, UserRole.DIRECTOR, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Not enough permissions")
+    
+    if entity_type == "reservation":
+        res_query = select(Reservation).where(Reservation.id == entity_id)
+        res_res = await db.execute(res_query)
+        res = res_res.scalar_one_or_none()
+        if res:
+            res.is_deletion_pending = False
+            res.deletion_requested_by_id = None
+            await db.commit()
+            await log_action(db, current_user, "DELETE_REJECTED", "Reservation", entity_id, f"Удаление брони #{entity_id} отклонено.", request)
+    elif entity_type == "invoice":
+        inv_query = select(Invoice).where(Invoice.id == entity_id)
+        inv_res = await db.execute(inv_query)
+        inv = inv_res.scalar_one_or_none()
+        if inv:
+            inv.is_deletion_pending = False
+            inv.deletion_requested_by_id = None
+            await db.commit()
+            await log_action(db, current_user, "DELETE_REJECTED", "Invoice", entity_id, f"Удаление фактуры #{entity_id} отклонено.", request)
+        else:
+            # Deep debug: list all IDs
+            all_invoices = await db.execute(select(Invoice.id))
+            ids = [row[0] for row in all_invoices.all()]
+            raise HTTPException(status_code=404, detail=f"Invoice #{entity_id} not found (REJECT). Available IDs: {ids}")
+    
+    return {"ok": True}
+
+@router.post("/deletion-requests/force-cleanup")
+async def force_cleanup(
+    db: AsyncSession = Depends(deps.get_db),
+    current_user: User = Depends(deps.get_current_user),
+) -> Any:
+    """Forcefully delete everything marked for deletion (Emergency ONLY)."""
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.ADMIN]:
+        raise HTTPException(status_code=403, detail="Only Director can force cleanup")
+    
+    try:
+        # 1. Nullify all cross-table foreign keys to avoid circular dependency errors
+        # Nullify Reservation.source_invoice_id
+        await db.execute(update(Reservation).where(Reservation.is_deletion_pending == True).values(source_invoice_id=None))
+        # Nullify Invoice.reservation_id (careful, it's unique)
+        await db.execute(update(Invoice).where(Invoice.is_deletion_pending == True).values(reservation_id=None))
+        await db.flush()
+
+        # 2. Delete payments and unassigned sales first (to avoid FK errors from Invoice)
+        from app.models.sales import Payment, UnassignedSale
+        pending_inv_ids = select(Invoice.id).where(Invoice.is_deletion_pending == True)
+        await db.execute(delete(Payment).where(Payment.invoice_id.in_(pending_inv_ids)))
+        await db.execute(delete(UnassignedSale).where(UnassignedSale.invoice_id.in_(pending_inv_ids)))
+
+        # 3. Delete invoices
+        res_inv = await db.execute(delete(Invoice).where(Invoice.is_deletion_pending == True))
+        invoices_deleted = res_inv.rowcount
+        
+        # 4. Delete reservations (cascade triggers for items)
+        res_res = await db.execute(delete(Reservation).where(Reservation.is_deletion_pending == True))
+        reservations_deleted = res_res.rowcount
+        
+        await db.commit()
+        return {
+            "ok": True, 
+            "message": f"CLEANUP SUCCESS: Deleted {invoices_deleted} invoices and {reservations_deleted} reservations.",
+            "invoices_deleted": invoices_deleted,
+            "reservations_deleted": reservations_deleted
+        }
+    except Exception as e:
+        await db.rollback()
+        logging.error(f"Force cleanup failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"FORCE-CLEANUP FAILED: {str(e)}")

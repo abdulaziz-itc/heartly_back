@@ -210,7 +210,10 @@ async def get_reservations(
     is_tovar_skidka: Optional[bool] = None,
     inv_num: Optional[str] = None,
     med_rep_ids: Optional[List[int]] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    warehouse_id: Optional[int] = None,
+    med_org_id: Optional[int] = None,
+    region_ids: Optional[List[int]] = None
 ) -> List[Reservation]:
     query = select(Reservation).options(
         selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.manufacturers),
@@ -220,37 +223,62 @@ async def get_reservations(
         selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
         selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
         selectinload(Reservation.invoice).selectinload(Invoice.payments).selectinload(Payment.processed_by)
-    ).where(Reservation.is_deletion_pending == False).order_by(Reservation.date.desc())
+    ).order_by(Reservation.date.desc())
 
     if status:
         query = query.where(Reservation.status == status)
 
+    if warehouse_id:
+        query = query.where(Reservation.warehouse_id == warehouse_id)
+
+    has_joined_org = False
+
     # Apply Med Rep filter (Creator or Assigned)
     if med_rep_id:
-        query = query.join(Reservation.med_org, isouter=True).where(
+        query = query.join(Reservation.med_org, isouter=True)
+        has_joined_org = True
+        query = query.where(
             (Reservation.created_by_id == med_rep_id) |
             (MedicalOrganization.assigned_reps.any(id=med_rep_id))
         )
     elif med_rep_ids:
-        query = query.join(Reservation.med_org, isouter=True).where(
+        query = query.join(Reservation.med_org, isouter=True)
+        has_joined_org = True
+        query = query.where(
             (Reservation.created_by_id.in_(med_rep_ids)) |
             (MedicalOrganization.assigned_reps.any(User.id.in_(med_rep_ids)))
         )
+
+    # Filter by Region IDs (new multi-region support)
+    if region_ids:
+        if not has_joined_org:
+            query = query.join(Reservation.med_org, isouter=True)
+            has_joined_org = True
+        query = query.where(MedicalOrganization.region_id.in_(region_ids))
     
     # Filter by Med Rep Name
     if med_rep_name and med_rep_name != "all":
         query = query.join(Reservation.created_by).where(User.full_name.ilike(f"%{med_rep_name}%"))
 
-    # Filter by Company (Med Org Name)
-    if med_org_name and med_org_name != "all":
-        if not med_rep_id: # already joined if med_rep_id exists
+    # Filter by Company (Med Org ID)
+    if med_org_id and med_org_id != "all":
+        if not has_joined_org: 
              query = query.join(Reservation.med_org, isouter=True)
+             has_joined_org = True
+        query = query.where(MedicalOrganization.id == med_org_id)
+
+    # Filter by Company Name (Legacy/Fallback)
+    if med_org_name and med_org_name != "all":
+        if not has_joined_org: 
+             query = query.join(Reservation.med_org, isouter=True)
+             has_joined_org = True
         query = query.where(MedicalOrganization.name.ilike(f"%{med_org_name}%"))
 
     # Filter by Org Type
     if med_org_type and med_org_type != "all":
-        if not med_rep_id and not med_org_name:
+        if not has_joined_org:
              query = query.join(Reservation.med_org, isouter=True)
+             has_joined_org = True
         query = query.where(MedicalOrganization.org_type == med_org_type)
 
     # Filter by Date Range
@@ -351,7 +379,11 @@ async def get_invoices(
     is_tovar_skidka: Optional[bool] = None,
     inv_num: Optional[str] = None,
     med_rep_ids: Optional[List[int]] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    warehouse_id: Optional[int] = None,
+    has_debt: bool = False,
+    med_org_id: Optional[int] = None,
+    region_ids: Optional[List[int]] = None
 ) -> List[Invoice]:
     query = select(Invoice).options(
         selectinload(Invoice.payments).selectinload(Payment.processed_by),
@@ -361,41 +393,89 @@ async def get_invoices(
         selectinload(Invoice.reservation).selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
         selectinload(Invoice.reservation).selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
         selectinload(Invoice.reservation).selectinload(Reservation.created_by)
-    ).where(Invoice.is_deletion_pending == False).order_by(Invoice.date.desc())
+    ).order_by(Invoice.date.desc())
 
     if status:
         query = query.where(Invoice.status == status)
 
+    if has_debt:
+        query = query.where(Invoice.total_amount > Invoice.paid_amount)
+
+    if warehouse_id:
+        query = query.where(Invoice.reservation.has(warehouse_id=warehouse_id))
+
+    has_joined_res = False
+    has_joined_org = False
+
     if med_rep_id:
+        query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True)
+        has_joined_res = True
+        has_joined_org = True
         # Filter invoices through their associated reservation and medical organization
-        query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True).where(
+        query = query.where(
             (Reservation.created_by_id == med_rep_id) |
             (MedicalOrganization.assigned_reps.any(id=med_rep_id))
         )
     elif med_rep_ids:
-        query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True).where(
+        query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True)
+        has_joined_res = True
+        has_joined_org = True
+        query = query.where(
             (Reservation.created_by_id.in_(med_rep_ids)) |
             (MedicalOrganization.assigned_reps.any(User.id.in_(med_rep_ids)))
         )
     
+    # Filter by Region IDs (new multi-region support)
+    if region_ids:
+        if not has_joined_res:
+            query = query.join(Invoice.reservation)
+            has_joined_res = True
+        if not has_joined_org:
+            query = query.join(Reservation.med_org, isouter=True)
+            has_joined_org = True
+        query = query.where(MedicalOrganization.region_id.in_(region_ids))
+    
     # Filter by Med Rep Name
     if med_rep_name and med_rep_name != "all":
-        if not med_rep_id:
+        if not has_joined_res:
             query = query.join(Invoice.reservation)
-        query = query.join(Reservation.created_by).where(User.full_name.ilike(f"%{med_rep_name}%"))
+            has_joined_res = True
+        if not has_joined_org:
+            query = query.join(Reservation.med_org, isouter=True)
+            has_joined_org = True
+        query = query.join(Reservation.created_by, isouter=True).where(
+            (User.full_name.ilike(f"%{med_rep_name}%")) |
+            (MedicalOrganization.assigned_reps.any(User.full_name.ilike(f"%{med_rep_name}%")))
+        )
 
-    # Filter by Company
-    if med_org_name and med_org_name != "all":
-        if not med_rep_id and not med_rep_name:
-            query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True)
-        elif not med_rep_id and med_rep_name:
+    # Filter by Company ID
+    if med_org_id and med_org_id != "all":
+        if not has_joined_res:
+             query = query.join(Invoice.reservation)
+             has_joined_res = True
+        if not has_joined_org:
              query = query.join(Reservation.med_org, isouter=True)
+             has_joined_org = True
+        query = query.where(MedicalOrganization.id == med_org_id)
+
+    # Filter by Company Name (Legacy/Fallback)
+    if med_org_name and med_org_name != "all":
+        if not has_joined_res:
+            query = query.join(Invoice.reservation)
+            has_joined_res = True
+        if not has_joined_org:
+            query = query.join(Reservation.med_org, isouter=True)
+            has_joined_org = True
         query = query.where(MedicalOrganization.name.ilike(f"%{med_org_name}%"))
 
     # Filter by Org Type
     if med_org_type and med_org_type != "all":
-        if not any([med_rep_id, med_rep_name, med_org_name]):
-            query = query.join(Invoice.reservation).join(Reservation.med_org, isouter=True)
+        if not has_joined_res:
+            query = query.join(Invoice.reservation)
+            has_joined_res = True
+        if not has_joined_org:
+            query = query.join(Reservation.med_org, isouter=True)
+            has_joined_org = True
         query = query.where(MedicalOrganization.org_type == med_org_type)
 
     # Filter by Date
@@ -406,8 +486,9 @@ async def get_invoices(
 
     # Filter by Invoice Type
     if is_tovar_skidka is not None:
-        if not any([med_rep_id, med_rep_name, med_org_name, med_org_type]):
+        if not has_joined_res:
             query = query.join(Invoice.reservation)
+            has_joined_res = True
         query = query.where(Reservation.is_tovar_skidka == is_tovar_skidka)
 
     # Filter by Inv Num
@@ -415,9 +496,6 @@ async def get_invoices(
         query = query.where(Invoice.factura_number.ilike(f"%{inv_num}%"))
 
     query = query.offset(skip).limit(limit)
-    result = await db.execute(query)
-    return result.scalars().all()
-
     result = await db.execute(query)
     return result.scalars().all()
 
@@ -571,8 +649,13 @@ async def request_return_reservation_items(db: AsyncSession, reservation_id: int
     if not reservation:
         raise HTTPException(status_code=404, detail="Reservation not found")
         
-    if reservation.is_return_pending:
-        raise HTTPException(status_code=400, detail="Return already pending for this reservation")
+    # Allow re-submitting return request if already pending (it will just overwrite)
+    # if reservation.is_return_pending:
+    #     raise HTTPException(status_code=400, detail="Return already pending for this reservation")
+    
+    # Reset all requested quantities first to allow replacement of the request
+    for item in reservation.items:
+        item.return_requested_quantity = 0
         
     paid_ratio = 0.0
     if reservation.invoice and reservation.invoice.total_amount > 0:
@@ -589,12 +672,11 @@ async def request_return_reservation_items(db: AsyncSession, reservation_id: int
             continue
             
         available = res_item.quantity - res_item.returned_quantity
-        unpaid_qty = math.floor(available * (1 - paid_ratio))
-        
-        if return_req.quantity > unpaid_qty:
+        # Allow returning all available items, even if paid (excess goes to credit balance)
+        if return_req.quantity > available:
             raise HTTPException(
                 status_code=400, 
-                detail=f"Нельзя вернуть {return_req.quantity} шт. Доступно для возврата (неоплачено): {unpaid_qty} шт."
+                detail=f"Нельзя вернуть {return_req.quantity} шт. Доступно для возврата: {available} шт."
             )
             
         res_item.return_requested_quantity = return_req.quantity
@@ -622,7 +704,10 @@ async def execute_return_reservation_items(db: AsyncSession, reservation_id: int
         raise HTTPException(status_code=404, detail="Reservation not found")
         
     if not reservation.is_return_pending:
-        raise HTTPException(status_code=400, detail="No pending return for this reservation")
+        # Diagnostic logging
+        import logging
+        logging.error(f"400 ERROR: execute_return called for Reservation #{reservation_id} but is_return_pending is False.")
+        raise HTTPException(status_code=400, detail=f"No pending return for reservation #{reservation_id}")
         
     # Process returns
     returned_amount_total = 0.0
@@ -681,12 +766,23 @@ async def execute_return_reservation_items(db: AsyncSession, reservation_id: int
 
     # Apply global reductions
     if returned_amount_total > 0:
-        deduction_with_nds = returned_amount_total * (1 + (reservation.nds_percent / 100.0))
+        deduction_with_nds = returned_amount_total * (1 + ((reservation.nds_percent or 0) / 100.0))
         reservation.total_amount -= deduction_with_nds
         if reservation.invoice:
             reservation.invoice.total_amount -= deduction_with_nds
+            
+            # Handle Overpayment (Credit Balance) after deduction
+            if reservation.invoice.paid_amount > reservation.invoice.total_amount:
+                excess = reservation.invoice.paid_amount - reservation.invoice.total_amount
+                if reservation.med_org:
+                    reservation.med_org.credit_balance = (reservation.med_org.credit_balance or 0.0) + excess
+                
+                # We NO LONGER normalize to total_amount here, 
+                # so that (total_amount - paid_amount) shows the negative credit.
+                pass
+                
             # Update Invoice Status
-            if reservation.invoice.paid_amount >= reservation.invoice.total_amount and reservation.invoice.total_amount > 0:
+            if reservation.invoice.paid_amount >= reservation.invoice.total_amount and reservation.invoice.total_amount >= 0:
                 reservation.invoice.status = InvoiceStatus.PAID
                 
         # Update UnassignedSale records

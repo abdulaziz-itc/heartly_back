@@ -14,17 +14,20 @@ async def get_global_realtime_dashboard(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
     month: int = None,
-    year: int = None
+    year: int = None,
+    region_id: int = None
 ) -> Any:
     """
     Returns real-time aggregated global statistics.
     Aggregates from Invoice (Revenue), Payment (Fact), and BonusLedger (Bonuses).
     """
     from sqlalchemy import and_
-    from app.models.sales import Invoice, Payment
+    from app.models.sales import Invoice, Payment, Reservation, ReservationItem
     from app.models.ledger import BonusLedger, LedgerType
-
+    from app.models.crm import MedicalOrganization
+    
     if current_user.role not in [
+        UserRole.INVESTOR,
         UserRole.DIRECTOR, 
         UserRole.DEPUTY_DIRECTOR, 
         UserRole.PRODUCT_MANAGER, 
@@ -47,6 +50,19 @@ async def get_global_realtime_dashboard(
     else:
         end_date = datetime(year, month + 1, 1)
 
+    # Regional Restriction for RM
+    allowed_region_ids = None
+    if current_user.role == UserRole.REGIONAL_MANAGER:
+        allowed_region_ids = [r.id for r in current_user.assigned_regions]
+        if region_id and region_id not in allowed_region_ids:
+            region_id = -1 
+    
+    # Use selected region or all allowed regions
+    final_region_ids = [region_id] if region_id else allowed_region_ids
+    if current_user.role == UserRole.REGIONAL_MANAGER and not final_region_ids:
+        # RM must have at least one region, otherwise no data
+        final_region_ids = [-1]
+
     # 1. Total Revenue (Paid amount from payments this month)
     rev_query = select(func.sum(Payment.amount)).where(
         and_(Payment.date >= start_date, Payment.date < end_date)
@@ -62,7 +78,6 @@ async def get_global_realtime_dashboard(
     )
 
     # 3. Total Items Sold (Quantity from invoices this month)
-    from app.models.sales import ReservationItem, Reservation
     qty_query = select(func.sum(ReservationItem.quantity)).join(
         Reservation, ReservationItem.reservation_id == Reservation.id
     ).join(
@@ -72,15 +87,36 @@ async def get_global_realtime_dashboard(
     )
     
     # Apply hierarchy filter if not director/admin
-    if current_user.role in [UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
+    is_team_manager = current_user.role in [UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]
+    
+    rep_ids = None
+    if is_team_manager:
         from app.crud.crud_user import get_descendant_ids
         rep_ids = await get_descendant_ids(db, current_user.id)
         if not rep_ids:
             rep_ids = [-1]
         
-        # Filter payments and ledger by users/doctors assigned to these reps
-        # (This part is simplified for brevity, in a large app it would use more joins)
-        pass 
+        # 1a. Filter payments by team
+        rev_query = rev_query.join(Invoice, Payment.invoice_id == Invoice.id).join(Reservation, Invoice.reservation_id == Reservation.id).where(
+            Reservation.created_by_id.in_(rep_ids)
+        )
+        
+        # 2a. Filter bonuses by team
+        bonus_query = bonus_query.where(BonusLedger.user_id.in_(rep_ids))
+        
+        # 3a. Filter qty by team
+        qty_query = qty_query.where(Reservation.created_by_id.in_(rep_ids))
+
+    # Apply region filter
+    if final_region_ids:
+        # Note: rev_query already joined Reservation above if is_team_manager
+        if not is_team_manager:
+            rev_query = rev_query.join(Invoice, Payment.invoice_id == Invoice.id).join(Reservation, Invoice.reservation_id == Reservation.id)
+        
+        rev_query = rev_query.join(MedicalOrganization, Reservation.med_org_id == MedicalOrganization.id).where(MedicalOrganization.region_id.in_(final_region_ids))
+        
+        # qty_query already joined Reservation and Invoice
+        qty_query = qty_query.join(MedicalOrganization, Reservation.med_org_id == MedicalOrganization.id).where(MedicalOrganization.region_id.in_(final_region_ids))
 
     rev_res = await db.execute(rev_query)
     bonus_res = await db.execute(bonus_query)
@@ -116,7 +152,7 @@ async def get_director_report_excel(
     from sqlalchemy.orm import selectinload
     from sqlalchemy import select, and_
     
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR, UserRole.ADMIN]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
 
     if not month:

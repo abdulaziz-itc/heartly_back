@@ -145,11 +145,11 @@ async def delete_reservation(
     current_user: User = Depends(deps.get_current_user),
     request: Request,
 ) -> Any:
-    if current_user.role not in [UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.MED_REP, UserRole.DIRECTOR, UserRole.ADMIN]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.MED_REP, UserRole.DIRECTOR, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not enough permissions to delete reservations.")
     
-    # Check if it's head of orders requesting deletion
-    if current_user.role == UserRole.HEAD_OF_ORDERS:
+    # Check roles that require approval for deletion
+    if current_user.role in [UserRole.HEAD_OF_ORDERS, UserRole.MED_REP, UserRole.DEPUTY_DIRECTOR, UserRole.FIELD_FORCE_MANAGER, UserRole.PRODUCT_MANAGER, UserRole.REGIONAL_MANAGER]:
         from app.models.sales import Reservation, Invoice
         res_query = select(Reservation).options(selectinload(Reservation.invoice)).where(Reservation.id == id)
         res_exc = await db.execute(res_query)
@@ -159,9 +159,8 @@ async def delete_reservation(
             raise HTTPException(status_code=404, detail="Reservation not found")
         
         # If reservation has an invoice, mark the invoice for deletion instead
-        # This makes it appear in "Invoices" section for Warehouse approval
         if reservation.invoice:
-            if reservation.invoice.status == InvoiceStatus.PAID:
+            if (reservation.invoice.paid_amount or 0) > 0 or reservation.invoice.status == InvoiceStatus.PAID:
                 raise HTTPException(status_code=400, detail="Нельзя удалить оплаченную счет-фактуру. Сначала отмените платежи.")
             
             reservation.invoice.is_deletion_pending = True
@@ -178,8 +177,9 @@ async def delete_reservation(
             f"Запрошено удаление брони #{id}. Ожидает подтверждения склада.",
             request
         )
-        return {"ok": True, "message": "Deletion request sent to Warehouse Head."}
+        return {"ok": True, "message": "Запрос на удаление отправлен заведующему склада (Deletion request sent to Warehouse Head)."}
 
+    # Roles that can delete immediately: DIRECTOR, ADMIN, HEAD_OF_WAREHOUSE
     from app.services.reservation_service import ReservationService
     await ReservationService.cancel_reservation(db=db, reservation_id=id)
     
@@ -204,7 +204,10 @@ async def read_reservations(
     med_org_type: Optional[str] = None,
     is_tovar_skidka: Optional[bool] = None,
     inv_num: Optional[str] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    med_rep_id: Optional[int] = None,
+    med_org_id: Optional[int] = None,
+    region_id: Optional[int] = None
 ) -> Any:
     """
     Retrieve reservations with optional filtering.
@@ -220,26 +223,48 @@ async def read_reservations(
     - med_org_name: Search by Medical Organization name.
     - status: Filter by ReservationStatus (draft, pending, approved, etc.)
     """
+    # Prioritize provided med_rep_id, but respect current_user roles
+    final_med_rep_id = med_rep_id
     med_rep_ids = None
     if current_user.role == UserRole.MED_REP:
-        med_rep_id = current_user.id
+        final_med_rep_id = current_user.id
     elif current_user.role in [UserRole.PRODUCT_MANAGER, UserRole.FIELD_FORCE_MANAGER, UserRole.REGIONAL_MANAGER]:
         from app.crud import crud_user
         med_rep_ids = await crud_user.get_descendant_ids(db, current_user.id)
         if not med_rep_ids:
             med_rep_ids = [-1]
-        med_rep_id = None
-    else:
-        med_rep_id = None
+        final_med_rep_id = None
     
-    dt_from = datetime.fromisoformat(date_from) if date_from else None
-    dt_to = datetime.fromisoformat(date_to) if date_to else None
+    # Regional Restriction for RM
+    final_region_ids = [r.id for r in current_user.assigned_regions] if current_user.assigned_regions else None
+    if current_user.role == UserRole.REGIONAL_MANAGER:
+        if region_id:
+            if region_id in (final_region_ids or []):
+                final_region_ids = [region_id]
+            else:
+                final_region_ids = [-1] # No access
+    elif region_id:
+        final_region_ids = [region_id]
+
+    dt_from = None
+    if date_from and isinstance(date_from, str) and date_from.strip():
+        try:
+            dt_from = datetime.fromisoformat(date_from)
+        except (ValueError, TypeError):
+            dt_from = None
+            
+    dt_to = None
+    if date_to and isinstance(date_to, str) and date_to.strip():
+        try:
+            dt_to = datetime.fromisoformat(date_to)
+        except (ValueError, TypeError):
+            dt_to = None
     
     return await crud_sales.get_reservations(
         db, 
         skip=skip, 
         limit=limit, 
-        med_rep_id=med_rep_id,
+        med_rep_id=final_med_rep_id,
         date_from=dt_from,
         date_to=dt_to,
         med_rep_name=med_rep_name,
@@ -248,7 +273,9 @@ async def read_reservations(
         is_tovar_skidka=is_tovar_skidka,
         inv_num=inv_num,
         med_rep_ids=med_rep_ids,
-        status=status
+        status=status,
+        med_org_id=med_org_id,
+        region_ids=final_region_ids
     )
 
 @router.get("/reservations/{id}")
@@ -265,7 +292,7 @@ async def read_reservation(
             selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
             selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
             selectinload(Reservation.created_by),
-            selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
+            selectinload(Reservation.warehouse).selectinload(Warehouse.stocks), selectinload(Reservation.warehouse).selectinload(Warehouse.med_org),
             selectinload(Reservation.invoice).selectinload(Invoice.payments).selectinload(Payment.processed_by)
         ).where(Reservation.id == id)
         
@@ -326,7 +353,7 @@ async def update_reservation_status(
     current_user: User = Depends(deps.get_current_user),
     request: Request,
 ) -> Any:
-    if current_user.role not in [UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS]:
         raise HTTPException(status_code=400, detail="Not enough permissions")
     
     if status_update.status == ReservationStatus.APPROVED:
@@ -387,6 +414,8 @@ async def read_invoices(
     inv_num: Optional[str] = None,
     status: Optional[str] = None,
     med_rep_id: Optional[int] = None,
+    med_org_id: Optional[int] = None,
+    has_debt: bool = False,
 ) -> Any:
     med_rep_ids = None
     if current_user.role == UserRole.MED_REP:
@@ -397,9 +426,8 @@ async def read_invoices(
         if not med_rep_ids:
             med_rep_ids = [-1]
         med_rep_id = None
-    else:
-        # Director or other admin — use the passed med_rep_id if provided
-        pass
+
+    region_ids = [r.id for r in current_user.assigned_regions] if current_user.assigned_regions else None
     
     dt_from = datetime.fromisoformat(date_from) if date_from else None
     dt_to = datetime.fromisoformat(date_to) if date_to else None
@@ -417,7 +445,10 @@ async def read_invoices(
         is_tovar_skidka=is_tovar_skidka,
         inv_num=inv_num,
         med_rep_ids=med_rep_ids,
-        status=status
+        status=status,
+        has_debt=has_debt,
+        med_org_id=med_org_id,
+        region_ids=region_ids
     )
 
 @router.get("/invoices/eligible-for-tovar-skidka", response_model=List[InvoiceSchema])
@@ -438,7 +469,7 @@ async def get_eligible_invoices_for_tovar_skidka(
             selectinload(Invoice.reservation).selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.category),
             selectinload(Invoice.reservation).selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
             selectinload(Invoice.reservation).selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
-            selectinload(Invoice.reservation).selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
+            selectinload(Invoice.reservation).selectinload(Reservation.warehouse).selectinload(Warehouse.stocks), selectinload(Reservation.warehouse).selectinload(Warehouse.med_org),
             selectinload(Invoice.reservation).selectinload(Reservation.created_by),
             selectinload(Invoice.payments).selectinload(Payment.processed_by)
         ).where(
@@ -533,7 +564,7 @@ async def create_bonus_payment(
     current_user: User = Depends(deps.get_current_user),
     request: Request,
 ) -> Any:
-    allowed_roles = {UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed_roles = {UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed_roles:
         raise HTTPException(
             status_code=403,
@@ -557,7 +588,7 @@ async def update_bonus_payment(
     current_user: User = Depends(deps.get_current_user),
     request: Request,
 ) -> Any:
-    allowed_roles = {UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed_roles = {UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed_roles:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
     result = await crud_sales.update_bonus_payment(db, payment_id=payment_id, obj_in=payment_in)
@@ -864,34 +895,21 @@ async def get_medrep_bonus_balance(
                 if inv_id and inv_id in invoice_to_reservation:
                     res_id = invoice_to_reservation[inv_id]
 
-            # Extract factura_number from the related invoice if available
-            factura_number = None
-            if getattr(h, 'invoice_item', None) and getattr(h.invoice_item, 'reservation', None):
-                inv_obj = getattr(h.invoice_item.reservation, 'invoice', None)
-                if inv_obj:
-                    factura_number = getattr(inv_obj, 'factura_number', None)
-
             history_data.append({
                 "id": h.id,
                 "amount": h.amount,
                 "ledger_type": h.ledger_type,
-                "is_paid": h.is_paid,
-                "target_month": h.target_month,
-                "target_year": h.target_year,
+                "created_at": h.created_at.isoformat(),
                 "notes": h.notes,
-                "created_at": h.created_at.isoformat() if h.created_at else None,
-                "doctor": {
-                    "id": h.doctor.id,
-                    "full_name": h.doctor.full_name
-                } if h.doctor else None,
-                "product": {
-                    "id": h.product.id,
-                    "name": h.product.name
-                } if getattr(h, 'product', None) else None,
-                "payment_id": h.payment_id,
                 "invoice_id": inv_id,
                 "reservation_id": res_id,
-                "factura_number": factura_number
+                "target_month": h.target_month,
+                "target_year": h.target_year,
+                "is_paid": h.is_paid,
+                "doctor": {"id": h.doctor.id, "full_name": h.doctor.full_name} if h.doctor else None,
+                "product": {"id": h.product.id, "name": h.product.name} if h.product else None,
+                "payment_amount": h.payment.amount if h.payment else None,
+                "payment_type": h.payment.payment_type if h.payment else None,
             })
         
         return {
@@ -903,8 +921,8 @@ async def get_medrep_bonus_balance(
         }
     except Exception as e:
         import traceback
-        raise HTTPException(status_code=500, detail=traceback.format_exc())
-
+        logger.error(f"Error in get_medrep_bonus_balance: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=str(e))
 @router.post("/allocate-bonus/")
 async def allocate_bonus(
     *,
@@ -968,7 +986,7 @@ async def get_admin_bonus_summary(
     Returns a summary of bonuses for all MedReps.
     Only accessible by Director, Deputy Director, Admin.
     """
-    allowed_roles = {UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed_roles = {UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed_roles:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
 
@@ -1026,7 +1044,7 @@ async def pay_medrep_bonus(
     """
     Marks unpaid ACCRUAL records as paid up to the requested amount.
     """
-    allowed_roles = {UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
+    allowed_roles = {UserRole.INVESTOR, UserRole.DEPUTY_DIRECTOR, UserRole.DIRECTOR, UserRole.ADMIN}
     if current_user.role not in allowed_roles:
         raise HTTPException(status_code=403, detail="Insufficient permissions")
         

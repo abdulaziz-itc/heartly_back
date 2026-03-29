@@ -170,7 +170,7 @@ class ReservationService:
                 selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.category),
                 selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
                 selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
-                selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
+                selectinload(Reservation.warehouse).selectinload(Warehouse.stocks), selectinload(Reservation.warehouse).selectinload(Warehouse.med_org),
                 selectinload(Reservation.created_by),
                 selectinload(Reservation.invoice).selectinload(Invoice.payments).selectinload(Payment.processed_by),
             ).where(Reservation.id == db_reservation.id)
@@ -232,8 +232,27 @@ class ReservationService:
             invoice.total_amount = reservation.total_amount
 
             # 5. Increment Pharmacy Stock (Ostatki Aptek)
+            # For Wholesale: Also create/update a dedicated Warehouse entry
+            from app.models.crm import MedicalOrganizationType
+            is_wholesale = reservation.med_org and reservation.med_org.org_type == MedicalOrganizationType.WHOLESALE
+            
+            dest_warehouse = None
+            if is_wholesale:
+                wh_query = select(Warehouse).where(Warehouse.med_org_id == reservation.med_org_id)
+                wh_res = await db.execute(wh_query)
+                dest_warehouse = wh_res.scalar_one_or_none()
+                
+                if not dest_warehouse:
+                    dest_warehouse = Warehouse(
+                        name=reservation.med_org.name,
+                        warehouse_type='central',
+                        med_org_id=reservation.med_org_id
+                    )
+                    db.add(dest_warehouse)
+                    await db.flush()
+
             for item in reservation.items:
-                # Find or create stock record for this pharmacy/product
+                # A. Regular Pharmacy Stock (Ostatki Aptek)
                 stk_query = select(MedicalOrganizationStock).where(
                     (MedicalOrganizationStock.med_org_id == reservation.med_org_id) &
                     (MedicalOrganizationStock.product_id == item.product_id)
@@ -241,9 +260,6 @@ class ReservationService:
                 stk_result = await db.execute(stk_query)
                 pharm_stock = stk_result.scalar_one_or_none()
                 
-                # Check if we should increment stock. 
-                # Note: This is simpler than keeping a separate "incremented" flag, but works
-                # if we assume activation is the transition that triggers this.
                 if reservation.status != ReservationStatus.APPROVED:
                     if pharm_stock:
                         pharm_stock.quantity += item.quantity
@@ -254,6 +270,25 @@ class ReservationService:
                             quantity=item.quantity
                         )
                         db.add(pharm_stock)
+                
+                # B. Wholesale Warehouse Stock (Optional)
+                if dest_warehouse:
+                    wh_stk_query = select(Stock).where(
+                        (Stock.warehouse_id == dest_warehouse.id) &
+                        (Stock.product_id == item.product_id)
+                    ).with_for_update()
+                    wh_stk_res = await db.execute(wh_stk_query)
+                    wh_stock = wh_stk_res.scalar_one_or_none()
+                    
+                    if wh_stock:
+                        wh_stock.quantity += item.quantity
+                    else:
+                        wh_stock = Stock(
+                            warehouse_id=dest_warehouse.id,
+                            product_id=item.product_id,
+                            quantity=item.quantity
+                        )
+                        db.add(wh_stock)
 
             # 6. Create UnassignedSale records for the assigned MedRep (not necessarily creator)
             # Find the primary MedRep for this pharmacy
@@ -288,6 +323,33 @@ class ReservationService:
                     invoice.paid_amount += credit_to_apply
                     reservation.med_org.credit_balance -= credit_to_apply
                     
+                    # SYNC: Reduce paid_amount on invoices that carry this credit
+                    logger.info(f"Applying credit: {credit_to_apply} for MedOrg {reservation.med_org_id}")
+                    
+                    overpaid_invoices_query = select(Invoice).join(
+                        Reservation, Invoice.reservation_id == Reservation.id
+                    ).where(
+                        (Reservation.med_org_id == reservation.med_org_id) &
+                        (Invoice.paid_amount > Invoice.total_amount) &
+                        (Invoice.id != invoice.id)
+                    ).order_by(Invoice.date.asc()).with_for_update()
+                    
+                    overpaid_res = await db.execute(overpaid_invoices_query)
+                    overpaid_invoices = overpaid_res.scalars().all()
+                    
+                    logger.info(f"Found {len(overpaid_invoices)} overpaid invoices to sync")
+                    
+                    temp_credit = credit_to_apply
+                    for op_inv in overpaid_invoices:
+                        if temp_credit <= 0: break
+                        excess = op_inv.paid_amount - op_inv.total_amount
+                        reduction = min(temp_credit, excess)
+                        logger.info(f"Reducing Invoice #{op_inv.id} paid_amount by {reduction}")
+                        op_inv.paid_amount -= reduction
+                        temp_credit -= reduction
+                    
+                    await db.flush()
+
                     if invoice.paid_amount >= invoice.total_amount:
                         invoice.status = InvoiceStatus.PAID
                     else:
@@ -299,7 +361,7 @@ class ReservationService:
                         amount=credit_to_apply,
                         payment_type=PaymentType.BANK,
                         processed_by_id=reservation.created_by_id,
-                        comment="Автоматическое списание с баланса (кредиторка)"
+                        comment="За счет кредиторки"
                     )
                     db.add(credit_payment)
 
@@ -347,7 +409,7 @@ class ReservationService:
                 selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.manufacturers),
                 selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.category),
                 selectinload(Reservation.created_by),
-                selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
+                selectinload(Reservation.warehouse).selectinload(Warehouse.stocks), selectinload(Reservation.warehouse).selectinload(Warehouse.med_org),
                 selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
                 selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
                 selectinload(Reservation.invoice).selectinload(Invoice.payments).selectinload(Payment.processed_by)

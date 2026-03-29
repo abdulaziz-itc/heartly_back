@@ -15,6 +15,15 @@ async def lifespan(app: FastAPI):
         print("Migrations applied successfully!")
     except Exception as e:
         print(f"Migration failed: {e}")
+    
+    print("Initializing database data...")
+    try:
+        from app.initial_data import init_db
+        await init_db()
+        print("Database initialization successful!")
+    except Exception as e:
+        print(f"Database initialization failed: {e}")
+        
     yield
 
 app = FastAPI(
@@ -46,3 +55,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 @app.get("/")
 def root():
     return {"message": "Welcome to Pharma ERP+CRM API"}
+
+@app.get("/api/v1/error-log")
+def read_error_log():
+    import os
+    if not os.path.exists("error_log.txt"):
+        return {"detail": "No error log found yet."}
+    with open("error_log.txt", "r") as f:
+        lines = f.readlines()
+        return {"log": "".join(lines[-150:])}

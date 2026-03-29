@@ -38,7 +38,7 @@ async def create_warehouse(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.ADMIN]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.DEPUTY_DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     db_obj = Warehouse(**warehouse_in.dict())
@@ -69,7 +69,7 @@ async def fulfill_stock(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """Add stock to a warehouse (Prixod)."""
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.ADMIN]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS, UserRole.ADMIN]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     # 1. Check if stock record exists
@@ -120,6 +120,7 @@ async def fulfill_stock(
 @router.get("/reservations/", response_model=List[ReservationSchema])
 async def list_reservations(
     status: Optional[str] = None,
+    warehouse_id: Optional[int] = None,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
@@ -134,12 +135,15 @@ async def list_reservations(
             selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.category),
             selectinload(Reservation.created_by),
             selectinload(Reservation.warehouse).selectinload(Warehouse.stocks),
+            selectinload(Reservation.warehouse).selectinload(Warehouse.med_org),
             selectinload(Reservation.med_org).selectinload(MedicalOrganization.region),
             selectinload(Reservation.med_org).selectinload(MedicalOrganization.assigned_reps),
             selectinload(Reservation.invoice).selectinload(Invoice.payments).selectinload(Payment.processed_by)
         ).order_by(Reservation.date.desc())
         if status:
             query = query.where(Reservation.status == status)
+        if warehouse_id:
+            query = query.where(Reservation.warehouse_id == warehouse_id)
         result = await db.execute(query)
         return result.scalars().all()
     except Exception as e:
@@ -154,7 +158,7 @@ async def activate_reservation(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """Activate a reservation: Lock stock and create Factura."""
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     try:
@@ -233,7 +237,7 @@ async def update_reservation_data(
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
     """Update reservation data like invoice number, date, or discount."""
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     reservation = await crud_sales.update_reservation_data(db, id, obj_in)
@@ -257,7 +261,7 @@ async def create_payment(
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
-    if current_user.role not in [UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
+    if current_user.role not in [UserRole.INVESTOR, UserRole.DIRECTOR, UserRole.HEAD_OF_ORDERS]:
         raise HTTPException(status_code=403, detail="Not enough permissions")
     
     payment = await FinancialService.process_payment(db, obj_in, current_user.id)
@@ -276,6 +280,7 @@ async def create_payment(
 
 @router.get("/invoices/", response_model=List[InvoiceSchema])
 async def list_invoices(
+    warehouse_id: Optional[int] = None,
     db: AsyncSession = Depends(deps.get_db),
     current_user: User = Depends(deps.get_current_user),
 ) -> Any:
@@ -287,7 +292,7 @@ async def list_invoices(
     from app.models.warehouse import Warehouse as WarehouseModel
     
     try:
-        result = await db.execute(
+        query = (
             select(InvoiceModel)
             .join(InvoiceModel.reservation)
             .where(Reservation.status.in_(["approved", "paid", "partial"]))
@@ -298,10 +303,16 @@ async def list_invoices(
                 selectinload(InvoiceModel.reservation).selectinload(Reservation.items).selectinload(ReservationItem.product).selectinload(Product.manufacturers),
                 selectinload(InvoiceModel.reservation).selectinload(Reservation.created_by),
                 selectinload(InvoiceModel.reservation).selectinload(Reservation.warehouse).selectinload(WarehouseModel.stocks),
+                selectinload(InvoiceModel.reservation).selectinload(Reservation.warehouse).selectinload(WarehouseModel.med_org),
                 selectinload(InvoiceModel.reservation).selectinload(Reservation.invoice),
                 selectinload(InvoiceModel.payments).selectinload(Payment.processed_by),
-            ).order_by(InvoiceModel.id.desc())
+            )
         )
+        
+        if warehouse_id:
+            query = query.where(Reservation.warehouse_id == warehouse_id)
+            
+        result = await db.execute(query.order_by(InvoiceModel.id.desc()))
         return result.scalars().all()
     except Exception as e:
         import traceback

@@ -31,11 +31,13 @@ class FinancialService:
                     raise HTTPException(status_code=400, detail="Invoice is already fully paid")
                 
                 # Update Paid Amount (with overpayment handling)
+                initial_payment_amount = obj_in.amount
                 remaining_payment = obj_in.amount
-                to_apply = min(remaining_payment, invoice.total_amount - invoice.paid_amount)
                 
-                invoice.paid_amount += to_apply
-                remaining_payment -= to_apply
+                # First, pay THIS invoice up to 100%
+                to_apply_this = min(remaining_payment, invoice.total_amount - invoice.paid_amount)
+                invoice.paid_amount += to_apply_this
+                remaining_payment -= to_apply_this
                 
                 if invoice.paid_amount >= invoice.total_amount:
                     invoice.status = InvoiceStatus.PAID
@@ -43,9 +45,10 @@ class FinancialService:
                     invoice.status = InvoiceStatus.PARTIAL
                 
                 # 2. Create Payment Record (Postupleniya) for THIS invoice
+                # We record the WHOLE amount here as the payment event, but we'll distribute logic below
                 payment = Payment(
                     invoice_id=invoice.id,
-                    amount=to_apply,
+                    amount=initial_payment_amount,
                     payment_type=obj_in.payment_type,
                     processed_by_id=processor_id,
                     comment=obj_in.comment
@@ -86,6 +89,9 @@ class FinancialService:
                     for item in reservation.items:
                         if item.marketing_amount:
                             payment_bonus_amount += (item.quantity * item.marketing_amount) * payment_ratio
+                    
+                    # Round to nearest integer to avoid fractions ("kopeyki")
+                    payment_bonus_amount = float(round(payment_bonus_amount))
                     
                     if payment_bonus_amount > 0 and target_medrep_id:
                         now = datetime.utcnow()
@@ -149,7 +155,9 @@ class FinancialService:
                 if remaining_payment > 0 and reservation and reservation.med_org_id:
                     # Find other unpaid invoices for this company
                     from app.models.sales import Invoice as InvoiceModel
-                    other_inv_query = select(InvoiceModel).join(Reservation).where(
+                    other_inv_query = select(InvoiceModel).join(
+                        Reservation, InvoiceModel.reservation_id == Reservation.id
+                    ).where(
                         (Reservation.med_org_id == reservation.med_org_id) &
                         (InvoiceModel.id != invoice.id) &
                         (InvoiceModel.status != InvoiceStatus.PAID)
@@ -177,11 +185,11 @@ class FinancialService:
                             amount=apply_other,
                             payment_type=obj_in.payment_type,
                             processed_by_id=processor_id,
-                            comment=f"Автоматическое покрытие переплаты от счета #{invoice.id}"
+                            comment=f"За счет переплаты (счет #{invoice.id})"
                         )
                         db.add(other_payment)
                     
-                    # If still remaining, add to organization's credit balance
+                    # If still remaining, add to organization's credit balance AND THIS invoice
                     if remaining_payment > 0:
                         from app.models.crm import MedicalOrganization
                         org_query = select(MedicalOrganization).where(MedicalOrganization.id == reservation.med_org_id).with_for_update()
@@ -189,6 +197,8 @@ class FinancialService:
                         org = org_result.scalar_one_or_none()
                         if org:
                             org.credit_balance = (org.credit_balance or 0.0) + remaining_payment
+                            # Push excess to initial invoice to show -Debt
+                            invoice.paid_amount += remaining_payment
 
                 await db.commit()
                 return payment
@@ -263,7 +273,8 @@ class FinancialService:
                 await db.flush()
 
                 # 4. Create Bonus Ledger (Pro-rata bonus realization)
-                bonus_amount = quantity * (reservation_item.marketing_amount or 0)
+                # Round to nearest integer to avoid fractions ("kopeyki")
+                bonus_amount = float(round(quantity * (reservation_item.marketing_amount or 0)))
                 accrual = BonusLedger(
                     doctor_id=doctor_id,
                     amount=bonus_amount,
@@ -346,7 +357,8 @@ class FinancialService:
                     raise HTTPException(status_code=400, detail=f"У продукта '{product.name}' не задан расход на маркетинг")
 
                 # 3. Compute the bonus amount
-                amount = quantity * marketing_expense
+                # Round to nearest integer to avoid fractions ("kopeyki")
+                amount = float(round(quantity * marketing_expense))
 
                 # 4. Check MedRep balance
                 current_balance = await FinancialService.get_medrep_bonus_balance(db, med_rep_id)
