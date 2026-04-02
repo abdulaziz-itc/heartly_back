@@ -7,6 +7,7 @@ from app.api import deps
 from app.models.visit import VisitPlan
 from app.schemas.visit_plan import VisitPlan as VisitPlanSchema, VisitPlanCreate, VisitPlanUpdate
 from app.models.user import User
+from app.models.crm import Doctor, MedicalOrganization
 
 router = APIRouter()
 
@@ -16,8 +17,15 @@ async def _get_plan_with_relations(db: AsyncSession, plan_id: int) -> VisitPlan:
     result = await db.execute(
         select(VisitPlan)
         .options(
-            selectinload(VisitPlan.doctor),
-            selectinload(VisitPlan.med_org)
+            selectinload(VisitPlan.med_rep),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.med_org).selectinload(MedicalOrganization.assigned_reps).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.med_org).selectinload(MedicalOrganization.region),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.specialty),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.category),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.region),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.assigned_rep).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.med_org).selectinload(MedicalOrganization.assigned_reps).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.med_org).selectinload(MedicalOrganization.region)
         )
         .where(VisitPlan.id == plan_id)
     )
@@ -33,8 +41,15 @@ async def get_visit_plans(
     """Retrieve visit plans."""
     try:
         query = select(VisitPlan).options(
-            selectinload(VisitPlan.doctor),
-            selectinload(VisitPlan.med_org)
+            selectinload(VisitPlan.med_rep),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.med_org).selectinload(MedicalOrganization.assigned_reps).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.med_org).selectinload(MedicalOrganization.region),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.specialty),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.category),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.region),
+            selectinload(VisitPlan.doctor).selectinload(Doctor.assigned_rep).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.med_org).selectinload(MedicalOrganization.assigned_reps).selectinload(User.assigned_regions),
+            selectinload(VisitPlan.med_org).selectinload(MedicalOrganization.region)
         )
         if med_rep_id:
             query = query.where(VisitPlan.med_rep_id == med_rep_id)
@@ -110,8 +125,10 @@ async def update_visit_plan(
     
     if is_completed is True:
         update_data["status"] = "completed"
+        db_obj.completed_at = datetime.utcnow()
     elif is_completed is False:
         update_data["status"] = "planned"
+        db_obj.completed_at = None
 
     for field in update_data:
         setattr(db_obj, field, update_data[field])

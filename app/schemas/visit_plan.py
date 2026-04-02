@@ -9,6 +9,7 @@ except ImportError:
     from pydantic import validator as computed_field
     AliasChoices = None
 from .crm import Doctor, MedicalOrganization
+from .user import UserBase
 
 class VisitPlanBase(BaseModel):
     planned_date: datetime
@@ -25,13 +26,16 @@ class VisitPlanCreate(VisitPlanBase):
 
 class VisitPlanUpdate(VisitPlanBase):
     is_completed: Optional[bool] = None
+    completed_at: Optional[datetime] = None
 
 class VisitPlan(VisitPlanBase):
     id: int
     med_rep_id: int
+    med_rep: Optional[UserBase] = None
     doctor: Optional[Doctor] = None
     med_org: Optional[MedicalOrganization] = None
     status: Optional[str] = None # pending, completed, cancelled
+    completed_at: Optional[datetime] = None
 
     if computed_field and hasattr(computed_field, '__name__') and computed_field.__name__ == 'computed_field':
         @computed_field
