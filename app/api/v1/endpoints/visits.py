@@ -91,7 +91,14 @@ async def get_user_plans(
         .order_by(VisitPlan.planned_date.desc())
     )
     plans = result.scalars().all()
-    return plans
+    
+    # Version-agnostic validation to catch serialization/lazy-load errors
+    if hasattr(VisitPlanSchema, "model_validate"):
+        validated_plans = [VisitPlanSchema.model_validate(p, from_attributes=True) for p in plans]
+    else:
+        validated_plans = [VisitPlanSchema.from_orm(p) for p in plans]
+        
+    return validated_plans
 
 @router.post("/plans/", response_model=VisitPlanSchema)
 async def create_visit_plan(
@@ -102,8 +109,21 @@ async def create_visit_plan(
     """
     Create a new visit plan.
     """
-    plan = VisitPlan(**plan_in.model_dump())
-    db.add(plan)
-    await db.commit()
-    await db.refresh(plan)
-    return plan
+    try:
+        data = plan_in.model_dump()
+        # Use med_rep_id from payload if provided (e.g. by a manager), fallback to current_user.id
+        if not data.get("med_rep_id"):
+            data["med_rep_id"] = current_user.id
+        
+        # Strip timezone to avoid database errors with TIMESTAMP WITHOUT TIME ZONE
+        if data.get("planned_date") and data["planned_date"].tzinfo:
+            data["planned_date"] = data["planned_date"].replace(tzinfo=None)
+            
+        plan = VisitPlan(**data)
+        db.add(plan)
+        await db.commit()
+        await db.refresh(plan)
+        return plan
+    except Exception as e:
+        await db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
