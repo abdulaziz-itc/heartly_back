@@ -1,6 +1,6 @@
 from typing import Optional, List
 from datetime import datetime, date
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from app.models.sales import ReservationStatus, InvoiceStatus, PaymentType
 from app.schemas.user import User
 from app.schemas.product import Product
@@ -45,6 +45,7 @@ class ReservationItemBase(BaseModel):
     price: float
     discount_percent: float = 0.0
     marketing_amount: Optional[float] = 0.0
+    salary_amount: Optional[float] = 0.0
     return_requested_quantity: int = 0
 
 class ReservationReturnItem(BaseModel):
@@ -74,12 +75,18 @@ class ReservationBase(BaseModel):
     description: Optional[str] = None
     validity_date: Optional[datetime] = None
     is_bonus_eligible: bool = True
+    is_salary_enabled: bool = True
     nds_percent: float = 12.0
     is_tovar_skidka: bool = False
     source_invoice_id: Optional[int] = None
     is_deletion_pending: bool = False
     deletion_requested_by_id: Optional[int] = None
     is_return_pending: bool = False
+
+    @field_validator("is_salary_enabled", mode="before")
+    @classmethod
+    def set_true_if_none(cls, v):
+        return True if v is None else v
 
 class ReservationCreate(ReservationBase):
     warehouse_id: int
@@ -99,11 +106,12 @@ class Reservation(ReservationBase):
     status: ReservationStatus
     total_amount: float
     is_bonus_eligible: bool
+    is_salary_enabled: bool
     nds_percent: Optional[float] = 12.0
     is_tovar_skidka: bool = False
     source_invoice_id: Optional[int] = None
     warehouse_id: Optional[int] = None
-    created_by_id: int
+    created_by_id: Optional[int] = None
     created_by: Optional[User] = None
     med_org: Optional[MedicalOrganization] = None
     warehouse: Optional[Warehouse] = None
@@ -121,11 +129,12 @@ class ReservationInInvoice(ReservationBase):
     status: ReservationStatus
     total_amount: float
     is_bonus_eligible: bool
+    is_salary_enabled: bool
     nds_percent: Optional[float] = 12.0
     is_tovar_skidka: bool = False
     source_invoice_id: Optional[int] = None
     warehouse_id: Optional[int] = None
-    created_by_id: int
+    created_by_id: Optional[int] = None
     created_by: Optional[User] = None
     med_org: Optional[MedicalOrganization] = None
     warehouse: Optional[Warehouse] = None
@@ -176,10 +185,11 @@ class ReservationLite(ReservationBase):
     status: ReservationStatus
     total_amount: float
     is_bonus_eligible: bool
+    is_salary_enabled: bool
     nds_percent: Optional[float] = 12.0
     med_org: Optional[MedicalOrganizationLite] = None
     warehouse_id: int
-    created_by_id: int
+    created_by_id: Optional[int] = None
     items: List[ReservationItem] = []
     
     class Config:

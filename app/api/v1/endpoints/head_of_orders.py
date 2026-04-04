@@ -301,7 +301,7 @@ async def list_invoices(
 ) -> Any:
     """List all invoices for Head of Orders."""
     from sqlalchemy.orm import selectinload
-    from app.models.sales import Invoice as InvoiceModel, ReservationItem, Reservation, Payment
+    from app.models.sales import Invoice as InvoiceModel, ReservationItem, Reservation, Payment, InvoiceStatus
     from app.models.product import Product
     from app.models.crm import MedicalOrganization
     from app.models.warehouse import Warehouse as WarehouseModel
@@ -328,10 +328,13 @@ async def list_invoices(
             query = query.where(Reservation.warehouse_id == warehouse_id)
             
         result = await db.execute(query.order_by(InvoiceModel.id.desc()))
-        return result.scalars().all()
+        invoices = result.scalars().all()
+
+        return invoices
+
     except Exception as e:
         import traceback
         trace = traceback.format_exc()
-        print("API ERROR:", trace)
-        raise HTTPException(status_code=400, detail=str(e) + "\n" + trace)
+        logger.error(f"Error in list_invoices: {trace}")
+        raise HTTPException(status_code=500, detail=trace)
 
