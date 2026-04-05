@@ -8,7 +8,7 @@ logger = logging.getLogger(__name__)
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, func, and_, or_
 from sqlalchemy.orm import selectinload
 
 from app.api import deps
