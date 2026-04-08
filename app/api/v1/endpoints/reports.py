@@ -124,9 +124,9 @@ async def get_comprehensive_reports(
     # 3. Fetch Bonus Ledger
     bonuses_query = select(
         BonusLedger.doctor_id,
-        func.sum(case((BonusLedger.ledger_type == "accrual", BonusLedger.amount), else_=0)).label("earned_bonus"),
-        func.sum(case((BonusLedger.ledger_type == "advance", -BonusLedger.amount), else_=0)).label("predinvest_given"),
-        func.sum(case((BonusLedger.ledger_type == "offset", -BonusLedger.amount), else_=0)).label("predinvest_paid_off")
+        func.sum(case({BonusLedger.ledger_type == "accrual": BonusLedger.amount}, else_=0)).label("earned_bonus"),
+        func.sum(case({BonusLedger.ledger_type == "advance": -BonusLedger.amount}, else_=0)).label("predinvest_given"),
+        func.sum(case({BonusLedger.ledger_type == "offset": -BonusLedger.amount}, else_=0)).label("predinvest_paid_off")
     ).join(Doctor, Doctor.id == BonusLedger.doctor_id)
 
     if start_date and end_date:
